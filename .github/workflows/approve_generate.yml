@@ -1,0 +1,217 @@
+name: "✅ Approve & Generate Post"
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  PYTHON_VERSION: "3.11"
+
+concurrency:
+  # One command at a time per Issue; queue up overlapping commands so a
+  # fast /regenerate /approve sequence doesn't race.
+  group: approve-generate-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+
+  # Gate: only run when:
+  #   1. Issue carries the "ai-curator" label
+  #   2. Comment starts with /approve, /reject or /regenerate
+  #   3. Commenter is OWNER / MEMBER / COLLABORATOR (blocks random users
+  #      on public repos and the GITHUB_TOKEN bot whose association is NONE)
+
+  check-command:
+    runs-on: ubuntu-latest
+    if: >-
+      contains(github.event.issue.labels.*.name, 'ai-curator') &&
+      (startsWith(github.event.comment.body, '/approve') ||
+       startsWith(github.event.comment.body, '/reject') ||
+       startsWith(github.event.comment.body, '/regenerate')) &&
+      (github.event.comment.author_association == 'OWNER')
+    outputs:
+      command: ${{ steps.parse.outputs.command }}
+      pick_id: ${{ steps.parse.outputs.pick_id }}
+      feedback: ${{ steps.parse.outputs.feedback }}
+      issue_number: ${{ steps.parse.outputs.issue_number }}
+    steps:
+      - name: Parse command
+        id: parse
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Default outputs
+          echo "command=invalid" >> "$GITHUB_OUTPUT"
+          echo "pick_id=0" >> "$GITHUB_OUTPUT"vehcile
+          echo "feedback=" >> "$GITHUB_OUTPUT"
+
+          # /regenerate <id> <feedback...>
+          if [[ "$COMMENT" =~ ^/regenerate[[:space:]]+([0-9]+)[[:space:]]+(.+)$ ]]; then
+            FEEDBACK="${BASH_REMATCH[2]}"
+            # Trim trailing whitespace.
+            FEEDBACK="${FEEDBACK%"${FEEDBACK##*[![:space:]]}"}"
+            {
+              echo "command=regenerate"
+              echo "pick_id=${BASH_REMATCH[1]}"
+              # Multi-line safe via heredoc.
+              echo "feedback<<__FEEDBACK_EOF__"
+              echo "$FEEDBACK"
+              echo "__FEEDBACK_EOF__"
+            } >> "$GITHUB_OUTPUT"
+
+          # /approve <id>
+          elif [[ "$COMMENT" =~ ^/approve[[:space:]]+([0-9]+) ]]; then
+            {
+              echo "command=approve"
+              echo "pick_id=${BASH_REMATCH[1]}"
+            } >> "$GITHUB_OUTPUT"
+
+          # /reject
+          elif [[ "$COMMENT" =~ ^/reject ]]; then
+            echo "command=reject" >> "$GITHUB_OUTPUT"
+          fi
+
+  
+  # /reject — close the Issue with a rejection comment.
+  
+  reject:
+    needs: check-command
+    runs-on: ubuntu-latest
+    if: needs.check-command.outputs.command == 'reject'
+    steps:
+      - name: Close issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-command.outputs.issue_number }},
+              body: '❌ Rejected. No post will be generated today.'
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-command.outputs.issue_number }},
+              state: 'closed'
+            });
+
+  
+  # /approve <id> — generate post, commit to posts/, close Issue.
+  
+  generate:
+    needs: check-command
+    runs-on: ubuntu-latest
+    if: needs.check-command.outputs.command == 'approve'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv + Python
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Add 🚀 reaction to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ github.event.comment.id }},
+              content: 'rocket'
+            });
+
+      - name: Run Phase 2 — Generate Post (commit mode)
+        env:
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_TRACING }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+          OUTPUT_DIR: "posts"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          uv run python scripts/generate_post.py \
+            --issue-number ${{ needs.check-command.outputs.issue_number }} \
+            --pick-id ${{ needs.check-command.outputs.pick_id }}
+
+      - name: Commit and push post
+        run: |
+          git config user.name "Content Foundry Agents Bot"
+          git config user.email "bot@content-foundry.local"
+          git add posts/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "📰 Post: $(date -u +%Y-%m-%d) (Issue #${{ needs.check-command.outputs.issue_number }})"
+            git push
+          fi
+
+  
+  # /regenerate <id> <feedback> — iterative preview; NO commit, NO close.
+  # Posts the new draft as a comment on the Issue.
+  
+  regenerate:
+    needs: check-command
+    runs-on: ubuntu-latest
+    if: needs.check-command.outputs.command == 'regenerate'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv + Python
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Add 🔄 reaction to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ github.event.comment.id }},
+              content: 'eyes'
+            });
+
+      - name: Run Copywriter — preview mode (no commit, no close)
+        env:
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_TRACING }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
+          PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+          OUTPUT_DIR: "posts"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEEDBACK: ${{ needs.check-command.outputs.feedback }}
+        run: |
+          uv run python scripts/generate_post.py \
+            --issue-number ${{ needs.check-command.outputs.issue_number }} \
+            --pick-id ${{ needs.check-command.outputs.pick_id }} \
+            --feedback "$FEEDBACK" \
+            --preview
